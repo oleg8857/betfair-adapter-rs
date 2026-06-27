@@ -50,3 +50,12 @@ pub enum ApiError {
     #[error("Empty response from server")]
     EmptyResponse,
 }
+
+impl ApiError {
+    /// Transient errors worth retrying (network / HTTP transport).
+    /// Permanent errors (e.g. `BotLoginError`) are pointless to retry.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(self, ApiError::ReqwestError(_))
+    }
+}

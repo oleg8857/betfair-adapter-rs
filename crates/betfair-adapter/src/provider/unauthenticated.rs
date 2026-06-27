@@ -33,22 +33,20 @@ impl BetfairRpcClient<Unauthenticated> {
         ApiError,
     > {
         let mut backoff = ExponentialBuilder::new().build();
-        let mut first_call = true;
         let (session_token, authenticated_client) = loop {
-            if !first_call {
-                // add exponential recovery
-                let next = backoff.next();
-                let Some(delay) = next else {
-                    return Err(ApiError::EyreError(eyre::eyre!("could not authenticate")));
-                };
-                sleep(delay).await;
+            match self.bot_log_in().await {
+                Ok(res) => break res,
+                Err(err) if err.is_retriable() => {
+                    let Some(delay) = backoff.next() else {
+                        // retries exhausted -> return the last error
+                        return Err(err);
+                    };
+                    tracing::warn!(?err, ?delay, "bot login failed, retrying");
+                    sleep(delay).await;
+                }
+                // permanent error -> no retries
+                Err(err) => return Err(err),
             }
-            first_call = true;
-            let Ok(res) = self.bot_log_in().await else {
-                continue;
-            };
-
-            break res;
         };
 
         let state = Authenticated {
