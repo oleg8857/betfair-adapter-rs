@@ -1,3 +1,4 @@
+use core::fmt;
 use core::marker::PhantomData;
 
 use betfair_types::keep_alive;
@@ -14,7 +15,7 @@ impl BetfairRpcClient<Authenticated> {
     ///
     /// # Returns
     /// A result containing either the response or an `ApiError`.
-    #[tracing::instrument(skip_all, ret, err, fields(req = ?request))]
+    #[tracing::instrument(skip_all, err, fields(req = ?request))]
     pub async fn send_request<T>(&self, request: T) -> Result<T::Res, ApiError>
     where
         T: BetfairRpcRequest + serde::Serialize + core::fmt::Debug,
@@ -79,7 +80,7 @@ impl BetfairRpcClient<Authenticated> {
     /// session time is 24 hours. Therefore, you should request Keep Alive within this time to
     /// prevent session expiry. If you don't call Keep Alive within the specified timeout period,
     /// the session will expire. Session times aren't determined or extended based on API activity.
-    #[tracing::instrument(skip_all, ret, err)]
+    #[tracing::instrument(skip_all, err)]
     pub fn keep_alive(&self) -> Result<BetfairRequest<keep_alive::Response, ()>, ApiError> {
         let endpoint = self.keep_alive.url();
         let client = self.state.authenticated_client.clone();
@@ -96,7 +97,7 @@ impl BetfairRpcClient<Authenticated> {
     }
 
     /// You can use Logout to terminate your existing session.
-    #[tracing::instrument(skip_all, ret, err)]
+    #[tracing::instrument(skip_all, err)]
     pub fn logout(&self) -> Result<BetfairRequest<keep_alive::Response, ()>, ApiError> {
         let endpoint = self.logout.url();
         let client = self.state.authenticated_client.clone();
@@ -114,12 +115,49 @@ impl BetfairRpcClient<Authenticated> {
 }
 
 /// Encalpsulated HTTP request for the Betfair API
-#[derive(Debug)]
 pub struct BetfairRequest<T, E> {
     request: reqwest::Request,
     client: reqwest::Client,
     result: PhantomData<T>,
     err: PhantomData<E>,
+}
+
+/// HTTP header names whose values must never be written to logs.
+///
+/// `reqwest`/`http` normalise header names to lowercase, so comparing against
+/// these lowercase literals is effectively case-insensitive.
+const SENSITIVE_HEADERS: &[&str] = &["x-authentication", "authorization", "cookie", "set-cookie"];
+
+// Manual `Debug` impl: the derived one prints the `client`, whose default
+// headers carry the `x-authentication` session token, leaking it into logs.
+// We omit the `client` entirely and redact sensitive headers of the request.
+impl<T, E> fmt::Debug for BetfairRequest<T, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BetfairRequest")
+            .field("method", self.request.method())
+            .field("url", &self.request.url().as_str())
+            .field("headers", &RedactedHeaders(self.request.headers()))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Wraps a `HeaderMap` to redact the values of sensitive headers when formatted
+/// with `Debug`.
+struct RedactedHeaders<'a>(&'a reqwest::header::HeaderMap);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = formatter.debug_map();
+        for (name, value) in self.0 {
+            if SENSITIVE_HEADERS.contains(&name.as_str()) {
+                map.entry(&name.as_str(), &"<redacted>");
+            } else {
+                map.entry(&name.as_str(), &value);
+            }
+        }
+        map.finish()
+    }
 }
 
 impl<T, E> BetfairRequest<T, E> {
@@ -214,4 +252,53 @@ where
 
     let error = serde_json::from_slice::<E>(bytes)?;
     Ok(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "super-secret-session-token";
+
+    /// Builds a `BetfairRequest` whose client *and* request both carry the
+    /// session token, mirroring how `logged_in_client` sets the default header.
+    fn request_carrying_token() -> BetfairRequest<(), ()> {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            "X-Authentication",
+            reqwest::header::HeaderValue::from_static(TOKEN),
+        );
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .default_headers(default_headers)
+            .build()
+            .expect("client builds");
+
+        let request = client
+            .get("https://api.betfair.com/keepAlive")
+            .header("X-Authentication", TOKEN)
+            .build()
+            .expect("request builds");
+
+        BetfairRequest {
+            request,
+            client,
+            result: PhantomData,
+            err: PhantomData,
+        }
+    }
+
+    #[test]
+    fn debug_does_not_leak_session_token() {
+        let formatted = format!("{:?}", request_carrying_token());
+
+        assert!(
+            !formatted.contains(TOKEN),
+            "session token leaked through Debug:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("<redacted>"),
+            "expected redacted header marker in Debug output:\n{formatted}"
+        );
+    }
 }

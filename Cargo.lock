@@ -221,6 +221,7 @@ dependencies = [
  "serde_urlencoded",
  "test-log",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "url",
  "wiremock",
