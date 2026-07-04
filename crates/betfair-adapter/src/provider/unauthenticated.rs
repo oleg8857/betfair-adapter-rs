@@ -90,6 +90,35 @@ impl BetfairRpcClient<Unauthenticated> {
         Ok((client, keep_alive))
     }
 
+    /// Builds an authenticated client from an already-obtained session token,
+    /// reusing it instead of performing a fresh bot login.
+    ///
+    /// Unlike [`Self::authenticate`], this does NOT spawn a keep-alive task and
+    /// returns no `JoinHandle`: renewing the session is the token owner's
+    /// responsibility, so this wrapper never runs a background heartbeat of its own.
+    pub fn with_session_token(
+        self,
+        session_token: SessionToken,
+    ) -> Result<Arc<BetfairRpcClient<Authenticated>>, ApiError> {
+        let authenticated_client =
+            logged_in_client(&self.secret_provider.application_key, &session_token)?;
+        let state = Authenticated {
+            session_token,
+            authenticated_client,
+        };
+        Ok(Arc::new(BetfairRpcClient {
+            state,
+            bot_login_client: self.bot_login_client,
+            rest_base: self.rest_base,
+            keep_alive: self.keep_alive,
+            bot_login: self.bot_login,
+            logout: self.logout,
+            login: self.login,
+            stream: self.stream,
+            secret_provider: self.secret_provider,
+        }))
+    }
+
     /// Creates a new instance of `UnauthenticatedBetfairRpcProvider` with a specific configuration.
     pub fn new_with_config(
         config: BetfairConfigBuilder<
