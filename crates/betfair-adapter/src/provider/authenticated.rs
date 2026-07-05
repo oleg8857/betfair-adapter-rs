@@ -41,8 +41,9 @@ impl BetfairRpcClient<Authenticated> {
             let res = serde_json::from_str::<T::Res>(&text)?;
             Ok(res)
         } else {
-            let text = full.text().await?;
-            let res = serde_json::from_str::<T::Error>(&text)?;
+            let status = full.status();
+            let bytes = full.bytes().await?;
+            let res = parse_betfair_error::<T::Error>(&bytes, status)?;
             Err(res.into())
         }
     }
@@ -250,6 +251,22 @@ where
         "Failed to execute request"
     );
 
+    // Betfair REST exceptions are wrapped in a SOAP-like fault envelope:
+    // `{faultcode, faultstring, detail: {exceptionname: "X", X: {..real fields..}}}`.
+    // The generated exception types (`E`) are flat, so the actual `errorCode`
+    // lives at `detail.<exceptionname>`, not at the root. Unwrap it here before
+    // deserializing `E`; fall back to the whole body for non-enveloped payloads.
+    if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Some(name) = envelope
+            .get("detail")
+            .and_then(|detail| detail.get("exceptionname"))
+            .and_then(serde_json::Value::as_str)
+        && let Some(inner) = envelope.get("detail").and_then(|detail| detail.get(name))
+    {
+        return Ok(serde_json::from_value::<E>(inner.clone())?);
+    }
+
+    // Fallback: body without the fault envelope.
     let error = serde_json::from_slice::<E>(bytes)?;
     Ok(error)
 }
