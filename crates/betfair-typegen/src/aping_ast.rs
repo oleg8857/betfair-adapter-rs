@@ -259,11 +259,13 @@ impl Aping {
                             .map(|item| Comment::new(item.clone()))
                             .collect();
 
+                        // Betfair serializes the `errorCode` field by the value
+                        // `name` (e.g. "INVALID_SESSION_INFORMATION"), NOT by the
+                        // `prefix-id` code (e.g. "AANGX-0002") which is only the
+                        // `faultstring`. Leave `id` empty so the generated enum
+                        // renames variants by name, matching the wire format.
                         ValidEnumValue {
-                            id: value.id.map_or_else(
-                                || format!("{}-0000", exception.prefix),
-                                |id| format!("{}-{:0>4}", exception.prefix, id),
-                            ),
+                            id: String::new(),
                             name: Name(value.name),
                             description: desc,
                         }
@@ -702,19 +704,19 @@ mod tests {
             name: Name("ErrorCode".to_owned()),
             valid_values: vec![
                 ValidEnumValue {
-                    id: "AANGX-0001".to_owned(),
+                    id: String::new(),
                     name: Name("INVALID_INPUT_DATA".to_owned()),
                     description: vec![Comment::new("Invalid input data".to_owned(),
                 )],
                 },
                 ValidEnumValue {
-                    id: "AANGX-0002".to_owned(),
+                    id: String::new(),
                     name: Name("INVALID_SESSION_INFORMATION".to_owned()),
                     description: vec![Comment::new("The session token passed is invalid or expired".to_owned(),
                 )],
                 },
                 ValidEnumValue {
-                    id: "AANGX-0013".to_owned(),
+                    id: String::new(),
                     name: Name("UNEXPECTED_ERROR".to_owned()),
                     description: vec![Comment::new("An unexpected internal error occurred that prevented successful request processing.".to_owned(),
                 )],
