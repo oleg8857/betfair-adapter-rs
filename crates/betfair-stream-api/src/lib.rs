@@ -346,11 +346,14 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
                 };
                 sleep(delay).await;
             }
-            first_call = true;
+            first_call = false;
 
             // Connect (with handshake) using retry logic.
             let mut stream = self.connect_with_retry(&mut from_stream_tx).await?;
             tracing::info!("Connected to {}", self.client.stream.url());
+            // Reset the backoff after a successful connection so that a long-lived stream
+            // does not exhaust the retry budget across unrelated disconnects.
+            backoff = ExponentialBuilder::new().build();
 
             loop {
                 let stream_next = pin!(stream.next());
