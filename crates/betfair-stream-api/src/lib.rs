@@ -7,7 +7,7 @@
 extern crate alloc;
 pub mod cache;
 use backon::{BackoffBuilder as _, ExponentialBuilder};
-use betfair_adapter::{Authenticated, BetfairRpcClient, Unauthenticated};
+use betfair_adapter::{Authenticated, BetfairRpcClient};
 pub use betfair_stream_types as types;
 use betfair_stream_types::{
     request::{RequestMessage, authentication_message, heartbeat_message::HeartbeatMessage},
@@ -48,8 +48,8 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 /// - `T`: A type that implements `MessageProcessor`, used to handle incoming `ResponseMessage` objects.
 #[derive(Debug, Clone)]
 pub struct BetfairStreamBuilder<T: MessageProcessor> {
-    /// betfair client
-    pub client: BetfairRpcClient<Unauthenticated>,
+    /// Authenticated betfair client; the stream never logs in or refreshes the session itself
+    pub client: Arc<BetfairRpcClient<Authenticated>>,
     /// Heartbeat interval (used only if heartbeat_enabled is true)
     pub heartbeat_interval: Option<Duration>,
     /// The intermediate processor of messages
@@ -183,12 +183,14 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
     ///
     /// # Parameters
     ///
-    /// * `client` - An authenticated Betfair RPC client for establishing the streaming connection.
+    /// * `client` - An already authenticated Betfair RPC client. The builder never logs in and
+    ///   never extends the session: refreshing the session token is the responsibility of the
+    ///   client's owner.
     ///
     /// # Returns
     ///
     /// A `BetfairStreamBuilder` configured with cache-based message processing.
-    pub fn new(client: BetfairRpcClient<Unauthenticated>) -> BetfairStreamBuilder<Cache> {
+    pub fn new(client: Arc<BetfairRpcClient<Authenticated>>) -> BetfairStreamBuilder<Cache> {
         BetfairStreamBuilder {
             client,
             heartbeat_interval: None,
@@ -205,13 +207,15 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
     ///
     /// # Parameters
     ///
-    /// * `client` - An authenticated Betfair RPC client for establishing the streaming connection.
+    /// * `client` - An already authenticated Betfair RPC client. The builder never logs in and
+    ///   never extends the session: refreshing the session token is the responsibility of the
+    ///   client's owner.
     ///
     /// # Returns
     ///
     /// A `BetfairStreamBuilder` configured to forward raw messages.
     pub fn new_without_cache(
-        client: BetfairRpcClient<Unauthenticated>,
+        client: Arc<BetfairRpcClient<Authenticated>>,
     ) -> BetfairStreamBuilder<Forwarder> {
         BetfairStreamBuilder {
             client,
@@ -332,23 +336,20 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
         mut from_stream_tx: Sender<T::Output>,
         mut to_stream_rx: impl futures::Stream<Item = RequestMessage> + Unpin,
     ) -> eyre::Result<()> {
-        let (mut client, _) = self.client.clone().authenticate().await?;
         let mut backoff = ExponentialBuilder::new().build();
         let mut first_call = true;
         'retry: loop {
             if !first_call {
                 // add exponential recovery
                 let Some(delay) = backoff.next() else {
-                    eyre::bail!("connection retry attempts exceeded")
+                    return Err(StreamRunError::RetriesExceeded.into());
                 };
                 sleep(delay).await;
             }
             first_call = true;
 
             // Connect (with handshake) using retry logic.
-            let mut stream = self
-                .connect_with_retry(&mut from_stream_tx, &mut client)
-                .await?;
+            let mut stream = self.connect_with_retry(&mut from_stream_tx).await?;
             tracing::info!("Connected to {}", self.client.stream.url());
 
             loop {
@@ -403,7 +404,6 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
     async fn connect_with_retry(
         &mut self,
         from_stream_tx: &mut Sender<T::Output>,
-        client: &mut Arc<BetfairRpcClient<Authenticated>>,
     ) -> eyre::Result<Framed<tokio_rustls::client::TlsStream<TcpStream>, StreamAPIClientCodec>>
     {
         let mut backoff = ExponentialBuilder::new().build();
@@ -412,7 +412,7 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
                 sleep(delay).await;
                 Ok(())
             } else {
-                eyre::bail!("exceeded retry attempts, could not connect");
+                Err(eyre::Report::new(StreamRunError::RetriesExceeded))
             }
         };
 
@@ -443,10 +443,7 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
             let tls_stream = tls_connector()?.connect(domain.clone(), stream).await?;
             let mut tls_stream = Framed::new(tls_stream, StreamAPIClientCodec);
 
-            match self
-                .handshake(from_stream_tx, client, &mut tls_stream)
-                .await
-            {
+            match self.handshake(from_stream_tx, &mut tls_stream).await {
                 Ok(()) => return Ok(tls_stream),
                 Err(err) => match err {
                     HandshakeErr::WaitAndRetry => {
@@ -454,12 +451,9 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
                         continue;
                     }
                     HandshakeErr::Reauthenticate => {
-                        let (new_client, _) = self.client.clone().authenticate().await?;
-                        *client = new_client;
-                        delay().await?;
-                        continue;
+                        return Err(StreamRunError::SessionRejected.into());
                     }
-                    HandshakeErr::Fatal => eyre::bail!("fatal error in stream processing"),
+                    HandshakeErr::Fatal => return Err(StreamRunError::Fatal.into()),
                 },
             }
         }
@@ -469,7 +463,6 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
     async fn handshake(
         &mut self,
         from_stream_tx: &mut Sender<T::Output>,
-        client: &BetfairRpcClient<Authenticated>,
         stream: &mut Framed<tokio_rustls::client::TlsStream<TcpStream>, StreamAPIClientCodec>,
     ) -> Result<(), HandshakeErr> {
         // await con message
@@ -509,7 +502,7 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
         // send auth msg
         let msg = authentication_message::AuthenticationMessage {
             id: Some(-1),
-            session: client.session_token().0.expose_secret().clone(),
+            session: self.client.session_token().0.expose_secret().clone(),
             app_key: self
                 .client
                 .secret_provider
@@ -584,6 +577,35 @@ impl<T: MessageProcessor> BetfairStreamBuilder<T> {
         Err(action)
     }
 }
+
+/// Terminal error of the streaming task.
+///
+/// The stream never logs in on its own, so a rejected session cannot be healed internally:
+/// the task exits with [`StreamRunError::SessionRejected`] and the owner of the session token
+/// is expected to obtain a fresh token, rebuild the client and resubscribe.
+///
+/// Returned inside [`eyre::Report`]; classify with `report.downcast_ref::<StreamRunError>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamRunError {
+    /// Betfair rejected the session token during the handshake.
+    SessionRejected,
+    /// Connection retry attempts were exhausted.
+    RetriesExceeded,
+    /// Non-recoverable protocol error (e.g. invalid application key or request).
+    Fatal,
+}
+
+impl fmt::Display for StreamRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionRejected => write!(f, "betfair rejected the stream session token"),
+            Self::RetriesExceeded => write!(f, "connection retry attempts exceeded"),
+            Self::Fatal => write!(f, "fatal error in stream processing"),
+        }
+    }
+}
+
+impl core::error::Error for StreamRunError {}
 
 #[derive(Debug)]
 enum HandshakeErr {

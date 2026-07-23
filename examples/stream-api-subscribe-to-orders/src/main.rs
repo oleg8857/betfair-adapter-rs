@@ -33,10 +33,11 @@ async fn main() -> eyre::Result<()> {
         identity: config.betfair_identity,
     };
     let bf_unauth = BetfairRpcClient::new(secret_provider.clone())?;
+    let (bf_client, _) = bf_unauth.authenticate().await?;
 
-    // connect to stream
+    // connect to stream, reusing the already authenticated client
     let stream =
-        BetfairStreamBuilder::<Cache>::new(bf_unauth).with_heartbeat(Duration::from_secs(5));
+        BetfairStreamBuilder::<Cache>::new(bf_client).with_heartbeat(Duration::from_secs(5));
     let (mut stream, _task) = stream.start::<10>();
 
     // start processing stream
